@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 
 /* ------------------------------------------------------------------ */
@@ -8,38 +8,51 @@ const BG_W = 54; // tiny canvas used for cheap, universal blur (Safari has no ct
 const BG_H = 96;
 const WA_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_STATUS_SECONDS = 60;
+const SCALE_FLOOR = 0.85; // smallest UI scale the auto-fit will use
 
 const MODES = [
   { id: 'auto', label: 'Auto' },
-  { id: 'original', label: 'Original' },
   { id: 'blur', label: 'Blur BG' },
-  { id: 'letterbox', label: 'Letterbox' },
   { id: 'fill', label: 'Fill' },
 ];
 
-const MODE_NAMES = {
-  original: 'Original',
-  blur: 'Blur BG',
-  letterbox: 'Letterbox',
-  fill: 'Fill',
-};
-
 const SPLITS = [
-  { id: 0, label: 'Single clip' },
-  { id: 60, label: '1 min parts' },
-  { id: 30, label: '30s parts' },
+  { id: 0, label: 'Single' },
+  { id: 60, label: '1 min' },
+  { id: 30, label: '30s' },
 ];
 
-const RESOLUTIONS = [720, 1080];
-const FPS_OPTIONS = [30, 60];
-const BITRATES = [2.5, 3.2, 5];
+const RESOLUTIONS = [
+  { id: 720, label: '720p' },
+  { id: 1080, label: '1080p' },
+];
+
+const FPS_OPTIONS = [
+  { id: 30, label: '30 FPS' },
+  { id: 60, label: '60 FPS' },
+];
+
+const BITRATES = [
+  { id: 3.2, label: '3.2' },
+  { id: 5, label: '5' },
+  { id: 8, label: '8' },
+];
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 let bgCanvas = null;
 
-/* H.264 High profile. Level 4.1 (0x29) for 720p30, level 4.2 (0x2A) for 1080p / 60 FPS. */
+function readViewport() {
+  if (typeof window === 'undefined') return { w: 390, h: 800 };
+  const vv = window.visualViewport;
+  return {
+    w: Math.round((vv && vv.width) || window.innerWidth),
+    h: Math.round((vv && vv.height) || window.innerHeight),
+  };
+}
+
+/* H.264 High profile. Level 4.1 for 720p30, level 4.2 for 1080p / 60 FPS. */
 function pickMime(fps, res) {
   if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
   const level = res >= 1080 || fps >= 60 ? '64002A' : '640029';
@@ -90,7 +103,7 @@ function orientationLabel(w, h) {
 }
 
 function fmtTime(s) {
-  if (!isFinite(s)) return '--:--';
+  if (!isFinite(s) || s < 0) return '0:00';
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return `${m}:${String(sec).padStart(2, '0')}`;
@@ -189,24 +202,20 @@ function paintFrame(canvas, video, mode) {
     return;
   }
 
-  if (mode === 'blur') {
-    if (!bgCanvas) {
-      bgCanvas = document.createElement('canvas');
-      bgCanvas.width = BG_W;
-      bgCanvas.height = BG_H;
-    }
-    const bctx = bgCanvas.getContext('2d');
-    bctx.imageSmoothingEnabled = true;
-    bctx.imageSmoothingQuality = 'high';
-    const cs = Math.max(BG_W / vw, BG_H / vh);
-    bctx.drawImage(video, (BG_W - vw * cs) / 2, (BG_H - vh * cs) / 2, vw * cs, vh * cs);
-    ctx.drawImage(bgCanvas, 0, 0, W, H);
-    ctx.fillStyle = 'rgba(0,0,0,0.42)';
-    ctx.fillRect(0, 0, W, H);
-  } else {
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, H);
+  // blur
+  if (!bgCanvas) {
+    bgCanvas = document.createElement('canvas');
+    bgCanvas.width = BG_W;
+    bgCanvas.height = BG_H;
   }
+  const bctx = bgCanvas.getContext('2d');
+  bctx.imageSmoothingEnabled = true;
+  bctx.imageSmoothingQuality = 'high';
+  const cs = Math.max(BG_W / vw, BG_H / vh);
+  bctx.drawImage(video, (BG_W - vw * cs) / 2, (BG_H - vh * cs) / 2, vw * cs, vh * cs);
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  ctx.fillStyle = 'rgba(0,0,0,0.42)';
+  ctx.fillRect(0, 0, W, H);
 
   const dw = vw * contain;
   const dh = vh * contain;
@@ -280,38 +289,99 @@ const IconPlay = (p) => (
   </Svg>
 );
 
+const IconUpload = (p) => (
+  <Svg {...p}>
+    <path d="M12 16V4" />
+    <path d="m7 9 5-5 5 5" />
+    <path d="M5 20h14" />
+  </Svg>
+);
+
 /* ------------------------------------------------------------------ */
-/*  Small UI pieces                                                    */
+/*  Small UI pieces (all sizes in rem so the auto-fit scale applies)   */
 /* ------------------------------------------------------------------ */
-function Pill({ active, disabled, onClick, children }) {
+
+/* Compact pill-shaped segmented toggle */
+function Seg({ options, value, onChange, disabled, compact }) {
   return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      aria-pressed={active}
+    <div
+      role="radiogroup"
       className={[
-        'pill h-11 shrink-0 rounded-full px-5 text-[15px] font-semibold tracking-tight transition-colors duration-150',
-        active ? 'bg-emerald-500 text-black' : 'border border-zinc-700 bg-zinc-950 text-zinc-200',
+        'flex min-w-0 flex-1 gap-0.5 rounded-full border border-zinc-700 bg-zinc-950 p-0.5',
         disabled ? 'opacity-40' : '',
       ].join(' ')}
     >
+      {options.map((o) => {
+        const active = value === o.id;
+        return (
+          <button
+            key={String(o.id)}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            disabled={disabled}
+            onClick={() => onChange(o.id)}
+            className={[
+              'pill min-w-0 flex-1 truncate rounded-full px-1 text-[0.9375rem] font-semibold tracking-tight transition-colors duration-150',
+              compact ? 'h-8' : 'h-10',
+              active ? 'bg-emerald-500 text-black' : 'text-zinc-200',
+            ].join(' ')}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SettingRow({ label, children }) {
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-[4.5rem] shrink-0 text-sm font-semibold text-zinc-400">{label}</span>
       {children}
-    </button>
+    </div>
   );
 }
 
-function Label({ children }) {
+function Field({ label, children }) {
   return (
-    <div className="mb-2 text-[13px] font-semibold uppercase tracking-wider text-zinc-400">{children}</div>
+    <div className="flex min-w-0 flex-col gap-1">
+      <span className="text-sm font-semibold leading-none text-zinc-400">{label}</span>
+      <div className="flex">{children}</div>
+    </div>
   );
 }
 
-function Stat({ k, v }) {
+/* Bottom sheet window (Exporting, Output, confirm) */
+function Sheet({ title, onClose, dim = false, z = 'z-50', children }) {
   return (
-    <div className="flex items-baseline justify-between gap-2 border-b border-zinc-900 py-2 last:border-b-0">
-      <span className="text-sm text-zinc-400">{k}</span>
-      <span className="text-[15px] font-semibold tabular-nums text-zinc-50">{v}</span>
+    <div
+      className={`fade-in fixed inset-0 ${z} flex items-end justify-center ${dim ? 'bg-black/40' : 'bg-black/70'}`}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={onClose}
+    >
+      <div
+        className="sheet-in flex max-h-[90dvh] w-full max-w-md flex-col rounded-t-3xl border border-b-0 border-zinc-700 bg-zinc-950"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 pb-1 pt-4">
+          <div className="text-xl font-bold tracking-tight">{title}</div>
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="pill flex h-10 w-10 items-center justify-center rounded-full bg-zinc-900 text-zinc-200"
+            >
+              <IconX size={18} />
+            </button>
+          )}
+        </div>
+        <div className="overflow-y-auto px-5 pb-[max(env(safe-area-inset-bottom),1.25rem)] pt-3">{children}</div>
+      </div>
     </div>
   );
 }
@@ -339,11 +409,11 @@ function SegmentCard({ seg, index }) {
   };
 
   return (
-    <div className="card-in flex gap-3 rounded-3xl border border-zinc-800 bg-zinc-950 p-3">
+    <div className="flex gap-3 rounded-3xl border border-zinc-800 bg-black p-3">
       <button
         type="button"
         onClick={toggle}
-        className="relative aspect-[9/16] w-[84px] shrink-0 overflow-hidden rounded-2xl bg-black"
+        className="relative aspect-[9/16] w-[5.25rem] shrink-0 overflow-hidden rounded-2xl bg-zinc-950"
         aria-label={`Preview part ${index + 1}`}
       >
         <video
@@ -366,8 +436,8 @@ function SegmentCard({ seg, index }) {
       <div className="flex min-w-0 flex-1 flex-col justify-between">
         <div>
           <div className="flex items-center gap-2">
-            <span className="text-[15px] font-bold text-emerald-400">Part {index + 1}</span>
-            <span className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-[13px] font-semibold uppercase text-zinc-300">
+            <span className="text-[0.9375rem] font-bold text-emerald-400">Part {index + 1}</span>
+            <span className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-sm font-semibold uppercase text-zinc-300">
               {seg.ext}
             </span>
           </div>
@@ -383,10 +453,10 @@ function SegmentCard({ seg, index }) {
               <button
                 type="button"
                 onClick={share}
-                className="pill flex h-12 flex-1 items-center justify-center gap-2 rounded-full bg-emerald-500 text-[15px] font-bold text-black"
+                className="pill flex h-12 min-w-0 flex-1 items-center justify-center gap-2 rounded-full bg-emerald-500 text-[0.9375rem] font-bold text-black"
               >
                 <IconWhatsApp size={20} />
-                Share to WhatsApp
+                <span className="truncate">Share to WhatsApp</span>
               </button>
               <a
                 href={seg.url}
@@ -401,7 +471,7 @@ function SegmentCard({ seg, index }) {
             <a
               href={seg.url}
               download={seg.file.name}
-              className="pill flex h-12 flex-1 items-center justify-center gap-2 rounded-full bg-emerald-500 text-[15px] font-bold text-black"
+              className="pill flex h-12 flex-1 items-center justify-center gap-2 rounded-full bg-emerald-500 text-[0.9375rem] font-bold text-black"
             >
               <IconDownload size={20} />
               Save video
@@ -419,13 +489,18 @@ function SegmentCard({ seg, index }) {
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const stageRef = useRef(null);
+  const mainRef = useRef(null);
   const inputRef = useRef(null);
   const audioRef = useRef(null);
   const cancelRef = useRef(false);
   const busyRef = useRef(false);
   const lastPctRef = useRef(-1);
+  const lastPosRef = useRef(0);
   const resultsRef = useRef([]);
   const sourceRef = useRef(null);
+  const seededRef = useRef(null);
+  const fitKeyRef = useRef('');
 
   const [source, setSource] = useState(null); // { url, file }
   const [info, setInfo] = useState(null); // { w, h, duration, size, name }
@@ -439,11 +514,27 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [error, setError] = useState('');
   const [confirmExit, setConfirmExit] = useState(false);
+  const [panel, setPanel] = useState('none'); // 'none' | 'output'
+  const [previewing, setPreviewing] = useState(false);
+  const [pos, setPos] = useState(0);
+  const [stage, setStage] = useState({ w: 0, h: 0 });
+  const [vp, setVp] = useState(readViewport);
 
+  const landscape = vp.w > vp.h;
+
+  /* Base UI scale from the real screen size; auto-fit may lower it further */
+  const baseScale = useMemo(() => {
+    const k = landscape ? Math.min(vp.h / 400, vp.w / 800) : Math.min(vp.h / 780, vp.w / 390);
+    return Math.min(1.1, Math.max(0.9, Math.round(k * 1000) / 1000));
+  }, [vp, landscape]);
+  const [uiScale, setUiScale] = useState(baseScale);
+
+  const hasInfo = Boolean(info);
   const warnings = useMemo(() => (info ? diagnose(info) : []), [info]);
   const segments = useMemo(() => (info ? buildSegments(info.duration, segLen) : []), [info, segLen]);
+  const mime = useMemo(() => pickMime(fps, res), [fps, res]);
 
-  /* Auto: true 9:16 stays untouched; anything else (landscape, square, 4:5, 3:4...) gets a blurred 9:16 fill */
+  /* Auto: true 9:16 stays untouched; anything else gets a blurred 9:16 fill */
   const effMode = useMemo(() => {
     if (!info) return 'original';
     if (mode !== 'auto') return mode;
@@ -451,6 +542,21 @@ export default function App() {
   }, [info, mode]);
 
   const dims = useMemo(() => (info ? outputDims(info, effMode, res) : { w: 720, h: 1280 }), [info, effMode, res]);
+
+  /* Preview box: fitted into the free space at the exact output shape, kept compact */
+  const fit = useMemo(() => {
+    if (!stage.w || !stage.h) return { w: 0, h: 0 };
+    const a = dims.w / dims.h;
+    const maxW = Math.min(stage.w * 0.94, (landscape ? 560 : 300) * uiScale);
+    const maxH = stage.h * 0.97;
+    let w = maxW;
+    let h = w / a;
+    if (h > maxH) {
+      h = maxH;
+      w = h * a;
+    }
+    return { w: Math.floor(w), h: Math.floor(h) };
+  }, [stage, dims, landscape, uiScale]);
 
   useEffect(() => {
     resultsRef.current = results;
@@ -467,19 +573,96 @@ export default function App() {
     []
   );
 
-  /* Close the exit sheet with Escape */
+  /* Track the visible screen size (browser toolbars, rotation, split-screen) */
   useEffect(() => {
-    if (!confirmExit) return undefined;
+    const on = () => {
+      const n = readViewport();
+      setVp((p) => (p.w === n.w && p.h === n.h ? p : n));
+    };
+    window.addEventListener('resize', on);
+    window.addEventListener('orientationchange', on);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', on);
+    return () => {
+      window.removeEventListener('resize', on);
+      window.removeEventListener('orientationchange', on);
+      if (window.visualViewport) window.visualViewport.removeEventListener('resize', on);
+    };
+  }, []);
+
+  /* Apply the UI scale to every rem-based size */
+  useLayoutEffect(() => {
+    const el = document.documentElement;
+    const prev = el.style.fontSize;
+    el.style.fontSize = `${(16 * uiScale).toFixed(2)}px`;
+    return () => {
+      el.style.fontSize = prev;
+    };
+  }, [uiScale]);
+
+  /* Auto-fit: restart from the base scale when the screen / video changes,
+     then shrink step by step until nothing overflows */
+  useLayoutEffect(() => {
+    const key = `${baseScale}|${landscape}|${info ? `${info.name}${info.w}${info.h}` : ''}`;
+    if (fitKeyRef.current !== key) {
+      fitKeyRef.current = key;
+      if (uiScale !== baseScale) {
+        setUiScale(baseScale);
+        return;
+      }
+    }
+    if (!info) return;
+    const m = mainRef.current;
+    if (!m) return;
+    const over = m.scrollHeight > m.clientHeight + 1 || m.scrollWidth > m.clientWidth + 1;
+    if (over && uiScale > SCALE_FLOOR + 0.001) {
+      setUiScale(Math.max(SCALE_FLOOR, Math.round((uiScale - 0.03) * 1000) / 1000));
+    }
+  }, [
+    uiScale,
+    baseScale,
+    landscape,
+    info,
+    vp,
+    warnings.length,
+    fps,
+    bitrate,
+    res,
+    mode,
+    segLen,
+    results.length,
+    error,
+  ]);
+
+  /* Measure the preview stage in pixels */
+  useEffect(() => {
+    if (!hasInfo) return undefined;
+    const el = stageRef.current;
+    if (!el) return undefined;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      setStage({ w: r.width, h: r.height });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [hasInfo]);
+
+  /* Escape closes the top-most window */
+  useEffect(() => {
+    if (!confirmExit && panel === 'none') return undefined;
     const onKey = (e) => {
-      if (e.key === 'Escape') setConfirmExit(false);
+      if (e.key !== 'Escape') return;
+      if (confirmExit) setConfirmExit(false);
+      else if (!busyRef.current) setPanel('none');
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [confirmExit]);
+  }, [confirmExit, panel]);
 
-  /* Live preview frame (before / after processing, and when settings change) */
+  /* Still frame: first frame on load, repaint when frame mode / size changes */
   useEffect(() => {
-    if (!info || busy) return undefined;
+    if (!info || busy || previewing) return undefined;
     let alive = true;
     (async () => {
       const v = videoRef.current;
@@ -489,13 +672,63 @@ export default function App() {
         await new Promise((r) => v.addEventListener('loadeddata', r, { once: true }));
       }
       if (!alive || busyRef.current) return;
-      await seekTo(v, Math.min(0.1, (v.duration || 0) / 2));
+      if (seededRef.current !== info) {
+        seededRef.current = info;
+        await seekTo(v, Math.min(0.1, (v.duration || 0) / 2));
+        if (alive) setPos(v.currentTime);
+      }
       if (alive && !busyRef.current) paintFrame(c, v, effMode);
     })();
     return () => {
       alive = false;
     };
-  }, [info, effMode, dims, busy]);
+  }, [info, effMode, dims, busy, previewing]);
+
+  /* Silent live preview playback, drawn exactly per decoded frame */
+  useEffect(() => {
+    if (!previewing || !info || busy) return undefined;
+    const v = videoRef.current;
+    const c = canvasRef.current;
+    if (!v || !c) return undefined;
+
+    let alive = true;
+    let handle = 0;
+    const useRVFC = typeof v.requestVideoFrameCallback === 'function';
+
+    v.muted = true;
+    if (v.ended || v.currentTime >= (v.duration || 0) - 0.05) v.currentTime = 0;
+
+    const onEnd = () => setPreviewing(false);
+    v.addEventListener('ended', onEnd);
+
+    const step = () => {
+      if (!alive) return;
+      paintFrame(c, v, effMode);
+      const t = v.currentTime;
+      if (Math.abs(t - lastPosRef.current) > 0.1) {
+        lastPosRef.current = t;
+        setPos(t);
+      }
+      schedule();
+    };
+    const schedule = () => {
+      handle = useRVFC ? v.requestVideoFrameCallback(step) : requestAnimationFrame(step);
+    };
+
+    v.play()
+      .then(() => {
+        if (alive) schedule();
+      })
+      .catch(() => setPreviewing(false));
+
+    return () => {
+      alive = false;
+      if (useRVFC) v.cancelVideoFrameCallback(handle);
+      else cancelAnimationFrame(handle);
+      v.removeEventListener('ended', onEnd);
+      if (!busyRef.current) v.pause();
+    };
+  }, [previewing, info, busy, effMode, dims]);
 
   const clearResults = () => {
     resultsRef.current.forEach((r) => URL.revokeObjectURL(r.url));
@@ -514,6 +747,10 @@ export default function App() {
     setError('');
     clearResults();
     setInfo(null);
+    setPreviewing(false);
+    setPanel('none');
+    setPos(0);
+    seededRef.current = null;
     if (sourceRef.current) URL.revokeObjectURL(sourceRef.current.url);
     setSource({ url: URL.createObjectURL(file), file });
   };
@@ -538,6 +775,23 @@ export default function App() {
     if (sourceRef.current) setError('This browser cannot decode that video.');
   };
 
+  const togglePreview = () => {
+    if (busy) return;
+    setPreviewing((p) => !p);
+  };
+
+  const onScrub = async (e) => {
+    const t = parseFloat(e.target.value);
+    const v = videoRef.current;
+    const c = canvasRef.current;
+    setPreviewing(false);
+    setPos(t);
+    if (!v || !c || busyRef.current) return;
+    v.pause();
+    await seekTo(v, t);
+    if (!busyRef.current) paintFrame(c, v, effMode);
+  };
+
   /* Exit editor -> back to the Select video screen */
   const exitEditor = () => {
     cancelRef.current = true; // stops any running capture loop
@@ -552,10 +806,14 @@ export default function App() {
     clearResults();
     if (sourceRef.current) URL.revokeObjectURL(sourceRef.current.url);
     sourceRef.current = null;
+    seededRef.current = null;
     setSource(null);
     setInfo(null);
     setError('');
     setProgress(null);
+    setPreviewing(false);
+    setPanel('none');
+    setPos(0);
     setConfirmExit(false);
   };
 
@@ -581,7 +839,7 @@ export default function App() {
     }
   };
 
-  const recordSegment = async (start, end, renderMode, mbps, targetFps, mime, onProgress) => {
+  const recordSegment = async (start, end, renderMode, mbps, targetFps, mimeType, onProgress) => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
 
@@ -597,7 +855,7 @@ export default function App() {
       videoBitsPerSecond: Math.round(mbps * 1_000_000),
       audioBitsPerSecond: 128_000,
     };
-    if (mime) opts.mimeType = mime;
+    if (mimeType) opts.mimeType = mimeType;
 
     const recorder = new MediaRecorder(stream, opts);
     const chunks = [];
@@ -665,7 +923,7 @@ export default function App() {
 
     if (cancelRef.current) throw new Error('CANCELLED');
 
-    const type = (recorder.mimeType || mime || 'video/webm').split(';')[0] || 'video/webm';
+    const type = (recorder.mimeType || mimeType || 'video/webm').split(';')[0] || 'video/webm';
     return new Blob(chunks, { type });
   };
 
@@ -681,10 +939,13 @@ export default function App() {
 
     setError('');
     clearResults();
+    setPanel('none');
+    setPreviewing(false);
     cancelRef.current = false;
     busyRef.current = true;
     lastPctRef.current = -1;
     setBusy(true);
+    video.pause();
 
     const segs = buildSegments(video.duration || info.duration, segLen);
     const total = segs.length;
@@ -706,7 +967,6 @@ export default function App() {
       wake = null;
     }
 
-    const mime = pickMime(fps, res);
     const base =
       (info.name || 'clip').replace(/\.[^.]+$/, '').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 40) || 'clip';
     const out = [];
@@ -737,6 +997,7 @@ export default function App() {
         setResults([...out]);
       }
       setProgress({ pct: 100, seg: total, total });
+      setPanel('output');
     } catch (e) {
       if (!e || e.message !== 'CANCELLED') {
         setError(`Processing failed: ${(e && e.message) || 'unknown error'}`);
@@ -751,6 +1012,14 @@ export default function App() {
       busyRef.current = false;
       setBusy(false);
       setProgress(null);
+      if (sourceRef.current) {
+        seekTo(video, 0).then(() => {
+          if (!busyRef.current && sourceRef.current && canvasRef.current) {
+            setPos(0);
+            paintFrame(canvasRef.current, video, effMode);
+          }
+        });
+      }
     }
   };
 
@@ -759,283 +1028,327 @@ export default function App() {
   };
 
   const inEditor = Boolean(source);
-  const frameName = mode === 'auto' ? `${MODE_NAMES[effMode]} (auto)` : MODE_NAMES[effMode];
-  const specLine = `${dims.w}×${dims.h} · ${fps} FPS · ${bitrate} Mbps`;
+  const atFloor = uiScale <= SCALE_FLOOR + 0.001;
+  const totalOutBytes = results.reduce((n, r) => n + r.size, 0);
+  const summary = `${dims.w}×${dims.h} · ${fps} FPS · ${bitrate} Mbps · ${
+    mime.includes('mp4') ? 'MP4' : 'WebM'
+  } · ${segments.length} ${segments.length === 1 ? 'clip' : 'clips'}`;
+  const showChips = warnings.length > 0 || fps === 60;
+
+  const chips = showChips && (
+    <div className="flex flex-wrap gap-1.5">
+      {warnings.map((w) => (
+        <span
+          key={w}
+          className="rounded-full border border-amber-800/70 bg-amber-950/40 px-3 py-1 text-sm font-semibold text-amber-400"
+        >
+          {w}
+        </span>
+      ))}
+      {fps === 60 && (
+        <span className="rounded-full border border-amber-800/70 bg-amber-950/40 px-3 py-1 text-sm font-semibold text-amber-400">
+          60 FPS needs a 60 FPS source
+        </span>
+      )}
+    </div>
+  );
 
   return (
-    <div className="min-h-[100dvh] bg-black text-zinc-100">
-      <div className="mx-auto flex min-h-[100dvh] w-full max-w-md flex-col px-4 pt-[max(env(safe-area-inset-top),1rem)]">
-        {/* Header */}
-        <header className="flex h-14 items-center justify-between">
-          {inEditor ? (
-            <button
-              type="button"
-              onClick={() => setConfirmExit(true)}
-              aria-label="Exit editor"
-              className="pill -ml-2 flex h-11 items-center gap-2 rounded-full px-2"
-            >
-              <span className="h-3 w-3 rounded-full bg-emerald-500" />
-              <span className="text-[18px] font-bold tracking-tight">ClipFix</span>
-            </button>
-          ) : (
-            <div className="flex items-center gap-2">
-              <span className="h-3 w-3 rounded-full bg-emerald-500" />
-              <span className="text-[18px] font-bold tracking-tight">ClipFix</span>
-            </div>
-          )}
-          {info && (
-            <button
-              type="button"
-              onClick={openPicker}
-              disabled={busy}
-              className="pill flex h-10 items-center gap-2 rounded-full border border-zinc-700 bg-zinc-950 px-4 text-sm font-semibold text-zinc-200 disabled:opacity-40"
-            >
-              <IconSwap size={16} />
-              Change
-            </button>
-          )}
-        </header>
-
-        {error && (
-          <div className="card-in mt-2 flex items-start justify-between gap-3 rounded-2xl border border-red-900/60 bg-red-950/40 px-4 py-3 text-[15px] text-red-300">
-            <span>{error}</span>
-            <button type="button" onClick={() => setError('')} aria-label="Dismiss" className="mt-0.5 text-red-300">
-              <IconX size={18} />
-            </button>
+    <div
+      className={`mx-auto flex w-full flex-col overflow-hidden bg-black pt-[max(env(safe-area-inset-top),0.5rem)] text-zinc-100 ${
+        landscape ? 'max-w-4xl' : 'max-w-md'
+      }`}
+      style={{
+        height: vp.h > 0 ? vp.h : '100dvh',
+        paddingLeft: 'max(env(safe-area-inset-left), 1rem)',
+        paddingRight: 'max(env(safe-area-inset-right), 1rem)',
+      }}
+    >
+      {/* Header */}
+      <header className={`flex shrink-0 items-center justify-between gap-2 ${landscape ? 'h-12' : 'h-14'}`}>
+        {inEditor ? (
+          <button
+            type="button"
+            onClick={() => setConfirmExit(true)}
+            aria-label="Exit editor"
+            className="pill -ml-2 flex h-11 shrink-0 items-center gap-2 rounded-full px-2"
+          >
+            <span className="h-3 w-3 rounded-full bg-emerald-500" />
+            <span className="text-[1.125rem] font-bold tracking-tight">ClipFix</span>
+          </button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="h-3 w-3 rounded-full bg-emerald-500" />
+            <span className="text-[1.125rem] font-bold tracking-tight">ClipFix</span>
           </div>
         )}
 
-        {/* Empty state: shutter-style picker */}
-        {!info && !source && (
-          <div className="flex flex-1 flex-col items-center justify-center pb-24">
-            <button
-              type="button"
-              onClick={openPicker}
-              aria-label="Select video"
-              className="shutter relative flex h-28 w-28 items-center justify-center rounded-full border-[3px] border-emerald-500"
-            >
-              <span className="shutter-core h-[88px] w-[88px] rounded-full bg-emerald-500" />
-            </button>
-            <div className="mt-6 text-base font-semibold tracking-wide text-zinc-300">Select video</div>
-          </div>
-        )}
-
-        {/* Loading state */}
-        {!info && source && !error && (
-          <div className="flex flex-1 items-center justify-center pb-24">
-            <div className="text-base font-semibold tracking-wide text-zinc-400">Reading file…</div>
-          </div>
-        )}
-
-        {/* Loaded state */}
         {info && (
-          <main className="flex flex-1 flex-col gap-6 pb-4 pt-2">
-            {/* Preview + diagnostics */}
-            <section className="flex gap-4">
-              <div className="relative flex aspect-[9/16] w-[36%] shrink-0 items-center justify-center overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950">
-                <canvas
-                  ref={canvasRef}
-                  width={dims.w}
-                  height={dims.h}
-                  className="max-h-full max-w-full object-contain"
-                  style={{ aspectRatio: `${dims.w} / ${dims.h}` }}
-                />
-                {busy && (
-                  <>
-                    <div className="scanline pointer-events-none absolute inset-x-0 top-0 h-16" />
-                    <div className="absolute left-2.5 top-2.5 flex items-center gap-1.5 rounded-full bg-black/70 px-2.5 py-1">
-                      <span className="rec-dot h-2 w-2 rounded-full bg-red-500" />
-                      <span className="text-[13px] font-bold tracking-wide text-white">REC</span>
-                    </div>
-                  </>
-                )}
-              </div>
+          <div className="flex min-w-0 items-center gap-2">
+            {results.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setPanel('output')}
+                disabled={busy}
+                className={`pill rounded-full border border-zinc-700 bg-zinc-950 px-3.5 text-[0.9375rem] font-semibold text-zinc-100 disabled:opacity-40 ${
+                  landscape ? 'h-10' : 'h-11'
+                }`}
+              >
+                Output · {results.length}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleProcess}
+              disabled={busy}
+              className={`pill flex items-center gap-2 rounded-full bg-emerald-500 px-4 text-[0.9375rem] font-bold text-black disabled:opacity-40 ${
+                landscape ? 'h-10' : 'h-11'
+              }`}
+            >
+              <IconUpload size={18} />
+              Export
+            </button>
+          </div>
+        )}
+      </header>
 
-              <div className="flex min-w-0 flex-1 flex-col justify-between">
-                <div>
-                  <Label>Diagnostics</Label>
-                  <div className="rounded-2xl border border-zinc-800 bg-zinc-950 px-3.5">
-                    <Stat k="Size" v={`${info.w}×${info.h}`} />
-                    <Stat k="Type" v={orientationLabel(info.w, info.h)} />
-                    <Stat k="Ratio" v={ratioLabel(info.w, info.h)} />
-                    <Stat k="Length" v={fmtDur(info.duration)} />
-                    <Stat k="File" v={fmtSize(info.size)} />
-                  </div>
-                </div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {warnings.length === 0 ? (
-                    <span className="rounded-full border border-emerald-800 bg-emerald-950/50 px-3 py-1.5 text-[13px] font-semibold text-emerald-400">
-                      Within limits
-                    </span>
-                  ) : (
-                    warnings.map((w) => (
-                      <span
-                        key={w}
-                        className="rounded-full border border-amber-800/70 bg-amber-950/40 px-3 py-1.5 text-[13px] font-semibold text-amber-400"
-                      >
-                        {w}
+      {error && (
+        <div className="card-in mb-2 flex shrink-0 items-start justify-between gap-3 rounded-2xl border border-red-900/60 bg-red-950/40 px-4 py-3 text-[0.9375rem] text-red-300">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError('')} aria-label="Dismiss" className="mt-0.5 text-red-300">
+            <IconX size={18} />
+          </button>
+        </div>
+      )}
+
+      {/* Empty state: shutter-style picker */}
+      {!info && !source && (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center pb-16">
+          <button
+            type="button"
+            onClick={openPicker}
+            aria-label="Select video"
+            className="shutter relative flex h-28 w-28 items-center justify-center rounded-full border-[3px] border-emerald-500"
+          >
+            <span className="shutter-core h-[5.5rem] w-[5.5rem] rounded-full bg-emerald-500" />
+          </button>
+          <div className="mt-6 text-base font-semibold tracking-wide text-zinc-300">Select video</div>
+        </div>
+      )}
+
+      {/* Loading state */}
+      {!info && source && !error && (
+        <div className="flex flex-1 items-center justify-center pb-16">
+          <div className="text-base font-semibold tracking-wide text-zinc-400">Reading file…</div>
+        </div>
+      )}
+
+      {/* Editor */}
+      {info && (
+        <main
+          ref={mainRef}
+          className={`flex min-h-0 flex-1 pb-[max(env(safe-area-inset-bottom),0.5rem)] ${
+            landscape ? 'flex-row gap-4' : 'flex-col gap-1'
+          }`}
+        >
+          {/* Preview + timeline */}
+          <div
+            className={`flex min-w-0 flex-1 flex-col ${landscape || atFloor ? 'min-h-0' : 'min-h-[14rem]'}`}
+          >
+            <div ref={stageRef} className="relative min-h-0 flex-1">
+              <div className="absolute inset-0 flex items-center justify-center">
+                <div
+                  className="relative overflow-hidden rounded-2xl bg-zinc-950 ring-1 ring-zinc-800"
+                  style={{ width: fit.w, height: fit.h }}
+                >
+                  <canvas
+                    ref={canvasRef}
+                    width={dims.w}
+                    height={dims.h}
+                    style={{ width: '100%', height: '100%', display: 'block' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={togglePreview}
+                    disabled={busy}
+                    aria-label={previewing ? 'Pause preview' : 'Play preview'}
+                    className="absolute inset-0 flex items-center justify-center"
+                  >
+                    {!previewing && !busy && (
+                      <span className="flex h-14 w-14 items-center justify-center rounded-full bg-black/55 text-white">
+                        <IconPlay size={26} />
                       </span>
-                    ))
+                    )}
+                  </button>
+                  {busy && (
+                    <>
+                      <div className="scanline pointer-events-none absolute inset-x-0 top-0 h-16" />
+                      <div className="absolute left-2.5 top-2.5 flex items-center gap-1.5 rounded-full bg-black/70 px-2.5 py-1">
+                        <span className="rec-dot h-2 w-2 rounded-full bg-red-500" />
+                        <span className="text-sm font-bold tracking-wide text-white">REC</span>
+                      </div>
+                    </>
                   )}
                 </div>
               </div>
-            </section>
+            </div>
 
-            {/* Controls */}
-            <section className="flex flex-col gap-5">
-              <div>
-                <Label>Frame</Label>
-                <div className="flex gap-2 overflow-x-auto">
-                  {MODES.map((m) => (
-                    <Pill key={m.id} active={mode === m.id} disabled={busy} onClick={() => setMode(m.id)}>
-                      {m.label}
-                    </Pill>
-                  ))}
-                </div>
+            <div className="flex shrink-0 items-center gap-3 pt-1">
+              <span className="w-11 text-sm tabular-nums text-zinc-300">{fmtTime(pos)}</span>
+              <input
+                type="range"
+                className="scrub min-w-0 flex-1"
+                min={0}
+                max={info.duration}
+                step={0.05}
+                value={Math.min(pos, info.duration)}
+                onChange={onScrub}
+                disabled={busy}
+                aria-label="Preview position"
+              />
+              <span className="w-11 text-right text-sm tabular-nums text-zinc-400">{fmtTime(info.duration)}</span>
+            </div>
+          </div>
+
+          {/* Info + settings */}
+          <div
+            className={
+              landscape
+                ? 'flex w-[52%] max-w-[26rem] shrink-0 flex-col justify-center gap-2'
+                : 'flex shrink-0 flex-col gap-2'
+            }
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0 truncate text-sm text-zinc-300">
+                {info.w}×{info.h} · {orientationLabel(info.w, info.h)} · {ratioLabel(info.w, info.h)} ·{' '}
+                {fmtSize(info.size)}
               </div>
-
-              <div>
-                <Label>Split</Label>
-                <div className="flex gap-2 overflow-x-auto">
-                  {SPLITS.map((s) => (
-                    <Pill key={s.id} active={segLen === s.id} disabled={busy} onClick={() => setSegLen(s.id)}>
-                      {s.label}
-                    </Pill>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <Label>Resolution</Label>
-                <div className="flex gap-2">
-                  {RESOLUTIONS.map((r) => (
-                    <Pill key={r} active={res === r} disabled={busy} onClick={() => setRes(r)}>
-                      {r}p
-                    </Pill>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <Label>Frame rate</Label>
-                <div className="flex gap-2">
-                  {FPS_OPTIONS.map((f) => (
-                    <Pill key={f} active={fps === f} disabled={busy} onClick={() => setFps(f)}>
-                      {f} FPS
-                    </Pill>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <Label>Bitrate</Label>
-                <div className="flex gap-2">
-                  {BITRATES.map((b) => (
-                    <Pill key={b} active={bitrate === b} disabled={busy} onClick={() => setBitrate(b)}>
-                      {b} Mbps
-                    </Pill>
-                  ))}
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-sm leading-relaxed text-zinc-300">
-                <div className="font-semibold tabular-nums text-zinc-100">{specLine}</div>
-                <div className="text-zinc-400">Frame: {frameName}</div>
-                {fps === 60 && <div className="mt-1 text-zinc-400">60 FPS only helps if the source is 60 FPS.</div>}
-              </div>
-            </section>
-
-            {/* Results */}
-            {results.length > 0 && (
-              <section className="flex flex-col gap-3">
-                <Label>Output · {results.length}</Label>
-                {results.map((seg, i) => (
-                  <SegmentCard key={seg.id} seg={seg} index={i} />
-                ))}
-              </section>
-            )}
-          </main>
-        )}
-
-        {/* Sticky action bar */}
-        {info && (
-          <div className="sticky bottom-0 -mx-4 bg-gradient-to-t from-black via-black to-transparent px-4 pb-[max(env(safe-area-inset-bottom),1rem)] pt-4">
-            {busy && progress ? (
-              <div className="rounded-3xl border border-zinc-700 bg-zinc-950 p-4">
-                <div className="mb-3 flex items-center justify-between text-[15px] font-semibold">
-                  <span className="text-zinc-300">
-                    Clip {progress.seg} of {progress.total}
-                  </span>
-                  <span className="tabular-nums text-emerald-400">{Math.floor(progress.pct)}%</span>
-                </div>
-                <div className="h-2.5 w-full overflow-hidden rounded-full bg-zinc-900">
-                  <div
-                    className="progress-fill h-full rounded-full bg-emerald-500"
-                    style={{ width: `${progress.pct}%` }}
-                  />
-                </div>
-                <div className="mt-3 flex items-center justify-between gap-3">
-                  <span className="text-sm text-zinc-400">Real-time · keep app open</span>
-                  <button
-                    type="button"
-                    onClick={handleCancel}
-                    className="pill flex h-10 items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-900 px-4 text-sm font-semibold text-zinc-100"
-                  >
-                    <IconX size={15} />
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            ) : (
               <button
                 type="button"
-                onClick={handleProcess}
-                className="pill flex h-14 w-full items-center justify-center rounded-full bg-emerald-500 text-[16px] font-bold tracking-tight text-black"
+                onClick={openPicker}
+                disabled={busy}
+                className="pill flex h-9 shrink-0 items-center gap-2 rounded-full border border-zinc-700 bg-zinc-950 px-3.5 text-sm font-semibold text-zinc-200 disabled:opacity-40"
               >
-                {results.length > 0 ? 'Process again' : 'Process'} · {segments.length}{' '}
-                {segments.length === 1 ? 'clip' : 'clips'}
+                <IconSwap size={15} />
+                Change
               </button>
+            </div>
+
+            {chips}
+
+            {landscape ? (
+              <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+                <Field label="Frame">
+                  <Seg options={MODES} value={mode} onChange={setMode} disabled={busy} compact />
+                </Field>
+                <Field label="Split">
+                  <Seg options={SPLITS} value={segLen} onChange={setSegLen} disabled={busy} compact />
+                </Field>
+                <Field label="Resolution">
+                  <Seg options={RESOLUTIONS} value={res} onChange={setRes} disabled={busy} compact />
+                </Field>
+                <Field label="Frame rate">
+                  <Seg options={FPS_OPTIONS} value={fps} onChange={setFps} disabled={busy} compact />
+                </Field>
+                <Field label="Bitrate (Mbps)">
+                  <Seg options={BITRATES} value={bitrate} onChange={setBitrate} disabled={busy} compact />
+                </Field>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <SettingRow label="Frame">
+                  <Seg options={MODES} value={mode} onChange={setMode} disabled={busy} />
+                </SettingRow>
+                <SettingRow label="Split">
+                  <Seg options={SPLITS} value={segLen} onChange={setSegLen} disabled={busy} />
+                </SettingRow>
+                <SettingRow label="Quality">
+                  <div className="flex min-w-0 flex-1 gap-2">
+                    <Seg options={RESOLUTIONS} value={res} onChange={setRes} disabled={busy} />
+                    <Seg options={FPS_OPTIONS} value={fps} onChange={setFps} disabled={busy} />
+                  </div>
+                </SettingRow>
+                <SettingRow label="Mbps">
+                  <Seg options={BITRATES} value={bitrate} onChange={setBitrate} disabled={busy} />
+                </SettingRow>
+              </div>
             )}
+
+            <div className="truncate text-sm tabular-nums text-zinc-400">{summary}</div>
           </div>
-        )}
-      </div>
+        </main>
+      )}
+
+      {/* Exporting window */}
+      {info && busy && progress && (
+        <Sheet title="Exporting" dim>
+          <div className="flex flex-col gap-4">
+            <div className="flex items-center justify-between text-[0.9375rem] font-semibold">
+              <span className="text-zinc-300">
+                Clip {progress.seg} of {progress.total}
+              </span>
+              <span className="tabular-nums text-emerald-400">{Math.floor(progress.pct)}%</span>
+            </div>
+            <div className="h-2.5 w-full overflow-hidden rounded-full bg-zinc-900">
+              <div className="progress-fill h-full rounded-full bg-emerald-500" style={{ width: `${progress.pct}%` }} />
+            </div>
+            <div className="text-sm text-zinc-400">Real-time export. Keep this screen open and don't lock your phone.</div>
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="pill flex h-12 w-full items-center justify-center rounded-full border border-zinc-700 bg-zinc-900 text-base font-semibold text-zinc-100"
+            >
+              Cancel
+            </button>
+          </div>
+        </Sheet>
+      )}
+
+      {/* Output window */}
+      {info && !busy && panel === 'output' && results.length > 0 && (
+        <Sheet title="Export complete" onClose={() => setPanel('none')}>
+          <div className="flex flex-col gap-3">
+            <div className="text-sm text-zinc-400">
+              {results.length} {results.length === 1 ? 'clip' : 'clips'} · {fmtSize(totalOutBytes)} total
+            </div>
+            {results.map((seg, i) => (
+              <SegmentCard key={seg.id} seg={seg} index={i} />
+            ))}
+            <button
+              type="button"
+              onClick={() => setPanel('none')}
+              className="pill mt-1 flex h-14 w-full items-center justify-center rounded-full border border-zinc-700 bg-zinc-900 text-base font-semibold text-zinc-100"
+            >
+              Done
+            </button>
+          </div>
+        </Sheet>
+      )}
 
       {/* Exit confirmation */}
       {confirmExit && (
-        <div
-          className="fade-in fixed inset-0 z-50 flex items-end justify-center bg-black/70 px-4 pb-[max(env(safe-area-inset-bottom),1rem)]"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Exit editor"
-          onClick={() => setConfirmExit(false)}
-        >
-          <div
-            className="sheet-in w-full max-w-md rounded-3xl border border-zinc-700 bg-zinc-950 p-5"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-xl font-bold tracking-tight">Exit editor?</div>
-            <p className="mt-1.5 text-[15px] leading-relaxed text-zinc-300">
-              {busy ? 'Processing will stop. ' : ''}
-              {results.length > 0 ? 'Generated clips will be discarded.' : 'Your selection will be cleared.'}
-            </p>
-            <div className="mt-5 flex gap-2">
-              <button
-                type="button"
-                onClick={() => setConfirmExit(false)}
-                className="pill h-12 flex-1 rounded-full border border-zinc-700 bg-zinc-900 text-[16px] font-semibold text-zinc-100"
-              >
-                Keep editing
-              </button>
-              <button
-                type="button"
-                onClick={exitEditor}
-                className="pill h-12 flex-1 rounded-full bg-red-500 text-[16px] font-bold text-white"
-              >
-                Exit
-              </button>
-            </div>
+        <Sheet title="Exit editor?" onClose={() => setConfirmExit(false)} z="z-[60]">
+          <p className="text-[0.9375rem] leading-relaxed text-zinc-300">
+            {busy ? 'Export will stop. ' : ''}
+            {results.length > 0 ? 'Exported clips will be discarded.' : 'Your selection will be cleared.'}
+          </p>
+          <div className="mt-5 flex gap-2">
+            <button
+              type="button"
+              onClick={() => setConfirmExit(false)}
+              className="pill h-12 flex-1 rounded-full border border-zinc-700 bg-zinc-900 text-base font-semibold text-zinc-100"
+            >
+              Keep editing
+            </button>
+            <button
+              type="button"
+              onClick={exitEditor}
+              className="pill h-12 flex-1 rounded-full bg-red-500 text-base font-bold text-white"
+            >
+              Exit
+            </button>
           </div>
-        </div>
+        </Sheet>
       )}
 
       {/* Hidden decode element (kept in DOM for iOS) */}
@@ -1044,6 +1357,7 @@ export default function App() {
         src={source ? source.url : undefined}
         className="clipfix-probe"
         playsInline
+        muted
         preload="auto"
         onLoadedMetadata={onMeta}
         onError={onVideoError}
