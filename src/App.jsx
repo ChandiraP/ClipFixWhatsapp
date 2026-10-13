@@ -10,10 +10,11 @@ const WA_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_STATUS_SECONDS = 60;
 const SCALE_FLOOR = 0.85; // smallest UI scale the auto-fit will use
 
+/* original -> export the video as it is (any shape, no crop / padding / blur)
+   blur     -> convert any video to 9:16 with a blurred background; true 9:16 stays as it is */
 const MODES = [
-  { id: 'auto', label: 'Auto' },
+  { id: 'original', label: 'Original' },
   { id: 'blur', label: 'Blur BG' },
-  { id: 'fill', label: 'Fill' },
 ];
 
 const SPLITS = [
@@ -52,6 +53,10 @@ function readViewport() {
   };
 }
 
+function isNineSixteen(info) {
+  return Math.abs(info.w / info.h - 9 / 16) <= 0.02;
+}
+
 /* H.264 High profile. Level 4.1 for 720p30, level 4.2 for 1080p / 60 FPS. */
 function pickMime(fps, res) {
   if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
@@ -83,7 +88,7 @@ function even(n) {
 
 /* Output canvas size.
    original -> keep the source's own shape, scale DOWN only (never upscale)
-   others   -> 9:16 canvas at the chosen resolution */
+   blur     -> 9:16 canvas at the chosen resolution */
 function outputDims(info, mode, res) {
   const longSide = even((res * 16) / 9);
   if (mode === 'original') {
@@ -187,22 +192,25 @@ function paintFrame(canvas, video, mode) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  const contain = Math.min(W / vw, H / vh);
-  const cover = Math.max(W / vw, H / vh);
-
+  /* As is: the canvas already has the video's own shape, so the video fills it exactly */
   if (mode === 'original') {
     ctx.drawImage(video, 0, 0, W, H);
     return;
   }
 
-  if (mode === 'fill') {
-    const dw = vw * cover;
-    const dh = vh * cover;
-    ctx.drawImage(video, Math.round((W - dw) / 2), Math.round((H - dh) / 2), Math.ceil(dw), Math.ceil(dh));
+  /* Blur BG: whole video fitted inside the frame, gap filled with a blurred copy */
+  const contain = Math.min(W / vw, H / vh);
+  const dw = vw * contain;
+  const dh = vh * contain;
+  const x = Math.round((W - dw) / 2);
+  const y = Math.round((H - dh) / 2);
+
+  // Nothing to fill: the video already covers the whole frame
+  if (dw >= W - 1 && dh >= H - 1) {
+    ctx.drawImage(video, 0, 0, W, H);
     return;
   }
 
-  // blur
   if (!bgCanvas) {
     bgCanvas = document.createElement('canvas');
     bgCanvas.width = BG_W;
@@ -213,13 +221,13 @@ function paintFrame(canvas, video, mode) {
   bctx.imageSmoothingQuality = 'high';
   const cs = Math.max(BG_W / vw, BG_H / vh);
   bctx.drawImage(video, (BG_W - vw * cs) / 2, (BG_H - vh * cs) / 2, vw * cs, vh * cs);
+
+  // Stretching the tiny copy back up is what produces the blur
   ctx.drawImage(bgCanvas, 0, 0, W, H);
   ctx.fillStyle = 'rgba(0,0,0,0.42)';
   ctx.fillRect(0, 0, W, H);
 
-  const dw = vw * contain;
-  const dh = vh * contain;
-  ctx.drawImage(video, Math.round((W - dw) / 2), Math.round((H - dh) / 2), Math.ceil(dw), Math.ceil(dh));
+  ctx.drawImage(video, x, y, Math.ceil(dw), Math.ceil(dh));
 }
 
 function canShareFile(file) {
@@ -413,7 +421,7 @@ function SegmentCard({ seg, index }) {
       <button
         type="button"
         onClick={toggle}
-        className="relative aspect-[9/16] w-[5.25rem] shrink-0 overflow-hidden rounded-2xl bg-zinc-950"
+        className="relative flex h-[9.33rem] w-[5.25rem] shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-zinc-950"
         aria-label={`Preview part ${index + 1}`}
       >
         <video
@@ -424,7 +432,7 @@ function SegmentCard({ seg, index }) {
           preload="metadata"
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
-          className="h-full w-full object-contain"
+          className="max-h-full max-w-full object-contain"
         />
         {!playing && (
           <span className="absolute inset-0 flex items-center justify-center bg-black/30 text-white">
@@ -504,7 +512,7 @@ export default function App() {
 
   const [source, setSource] = useState(null); // { url, file }
   const [info, setInfo] = useState(null); // { w, h, duration, size, name }
-  const [mode, setMode] = useState('auto');
+  const [mode, setMode] = useState('original');
   const [segLen, setSegLen] = useState(0); // 0 = single clip
   const [res, setRes] = useState(720);
   const [fps, setFps] = useState(30);
@@ -534,11 +542,13 @@ export default function App() {
   const segments = useMemo(() => (info ? buildSegments(info.duration, segLen) : []), [info, segLen]);
   const mime = useMemo(() => pickMime(fps, res), [fps, res]);
 
-  /* Auto: true 9:16 stays untouched; anything else gets a blurred 9:16 fill */
+  /* Effective render mode:
+     original -> as is
+     blur     -> blurred 9:16 frame, except a true 9:16 video which stays as it is */
   const effMode = useMemo(() => {
     if (!info) return 'original';
-    if (mode !== 'auto') return mode;
-    return Math.abs(info.w / info.h - 9 / 16) <= 0.02 ? 'original' : 'blur';
+    if (mode === 'original') return 'original';
+    return isNineSixteen(info) ? 'original' : 'blur';
   }, [info, mode]);
 
   const dims = useMemo(() => (info ? outputDims(info, effMode, res) : { w: 720, h: 1280 }), [info, effMode, res]);
@@ -547,7 +557,8 @@ export default function App() {
   const fit = useMemo(() => {
     if (!stage.w || !stage.h) return { w: 0, h: 0 };
     const a = dims.w / dims.h;
-    const maxW = Math.min(stage.w * 0.94, (landscape ? 560 : 300) * uiScale);
+    const baseCap = (landscape ? 560 : 300) * uiScale;
+    const maxW = Math.min(stage.w * 0.94, a > 1 ? baseCap * 1.2 : baseCap);
     const maxH = stage.h * 0.97;
     let w = maxW;
     let h = w / a;
@@ -1033,7 +1044,8 @@ export default function App() {
   const summary = `${dims.w}×${dims.h} · ${fps} FPS · ${bitrate} Mbps · ${
     mime.includes('mp4') ? 'MP4' : 'WebM'
   } · ${segments.length} ${segments.length === 1 ? 'clip' : 'clips'}`;
-  const showChips = warnings.length > 0 || fps === 60;
+  const keptAs916 = Boolean(info) && mode === 'blur' && isNineSixteen(info);
+  const showChips = warnings.length > 0 || fps === 60 || keptAs916;
 
   const chips = showChips && (
     <div className="flex flex-wrap gap-1.5">
@@ -1048,6 +1060,11 @@ export default function App() {
       {fps === 60 && (
         <span className="rounded-full border border-amber-800/70 bg-amber-950/40 px-3 py-1 text-sm font-semibold text-amber-400">
           60 FPS needs a 60 FPS source
+        </span>
+      )}
+      {keptAs916 && (
+        <span className="rounded-full border border-emerald-800 bg-emerald-950/50 px-3 py-1 text-sm font-semibold text-emerald-400">
+          Already 9:16 · kept as is
         </span>
       )}
     </div>
