@@ -167,12 +167,10 @@ function diagnose(info) {
 }
 
 function buildSegments(duration, segLen) {
-  // If Single mode but video exceeds 60s, force 30s splits
-  const effectiveSeg = (!segLen && duration > MAX_STATUS_SECONDS + 0.05) ? 30 : segLen;
-  if (!effectiveSeg || duration <= effectiveSeg + 0.05) return [{ start: 0, end: Math.min(duration, MAX_STATUS_SECONDS) }];
+  if (!segLen) return [{ start: 0, end: duration }];
   const segs = [];
-  for (let s = 0; s < duration - 0.001; s += effectiveSeg) {
-    segs.push({ start: s, end: Math.min(s + effectiveSeg, duration) });
+  for (let s = 0; s < duration - 0.001; s += segLen) {
+    segs.push({ start: s, end: Math.min(s + segLen, duration) });
   }
   // Drop imperceptible tails
   if (segs.length > 1) {
@@ -531,7 +529,7 @@ export default function App() {
   const [source, setSource] = useState(null); // { url, file }
   const [info, setInfo] = useState(null); // { w, h, duration, size, name }
   const [mode, setMode] = useState('original');
-  const [segLen, setSegLen] = useState(30); // default 30s splits for WhatsApp
+  const [segLen, setSegLen] = useState(0); // 0 = single clip by default (auto length)
   const [res, setRes] = useState(720);
   const [fps, setFps] = useState(30);
   const [bitrate, setBitrate] = useState('auto');
@@ -804,8 +802,9 @@ export default function App() {
     // Auto Blur BG for non-9:16 videos
     if (!isNineSixteen({ w, h })) setMode('blur');
     else setMode('original');
-    // Auto-split: if over 60s, default to 30s splits
-    if (duration > MAX_STATUS_SECONDS + 0.05) setSegLen(30);
+    // Default to Single (0) so videos under 60s stay as one file.
+    // If over 60s, automatically set to 30s splits.
+    setSegLen(duration > MAX_STATUS_SECONDS + 0.05 ? 30 : 0);
   };
 
   const onVideoError = () => {
