@@ -34,9 +34,9 @@ const FPS_OPTIONS = [
 ];
 
 const BITRATES = [
+  { id: 'auto', label: 'Auto' },
   { id: 3.2, label: '3.2' },
-  { id: 5, label: '5' },
-  { id: 8, label: '8' },
+  { id: 4, label: '4' },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -140,6 +140,22 @@ function ratioLabel(w, h) {
   return `${r.toFixed(2)}:1`;
 }
 
+/* Target 15.3 MB per part, clamp between 800 kbps and 4200 kbps */
+function autoBitrateMbps(durationSeconds) {
+  const TARGET_BYTES = 15.3 * 1024 * 1024;
+  const AUDIO_BPS = 131_072;
+  const MUX_BPS = 16_384;
+  const raw = (TARGET_BYTES * 8) / durationSeconds - AUDIO_BPS - MUX_BPS;
+  return Math.min(4.2, Math.max(0.8, raw / 1_000_000));
+}
+
+/* Estimated output size in bytes for a part */
+function estimatedBytes(mbps, durationSeconds) {
+  const videoBps = mbps * 1_000_000;
+  const audioBps = 131_072;
+  return ((videoBps + audioBps) / 8) * durationSeconds;
+}
+
 function diagnose(info) {
   const warnings = [];
   if (info.duration > MAX_STATUS_SECONDS + 0.05) warnings.push(`${fmtDur(info.duration)} · over 1 min`);
@@ -151,10 +167,12 @@ function diagnose(info) {
 }
 
 function buildSegments(duration, segLen) {
-  if (!segLen || duration <= segLen + 0.05) return [{ start: 0, end: duration }];
+  // If Single mode but video exceeds 60s, force 30s splits
+  const effectiveSeg = (!segLen && duration > MAX_STATUS_SECONDS + 0.05) ? 30 : segLen;
+  if (!effectiveSeg || duration <= effectiveSeg + 0.05) return [{ start: 0, end: Math.min(duration, MAX_STATUS_SECONDS) }];
   const segs = [];
-  for (let s = 0; s < duration - 0.001; s += segLen) {
-    segs.push({ start: s, end: Math.min(s + segLen, duration) });
+  for (let s = 0; s < duration - 0.001; s += effectiveSeg) {
+    segs.push({ start: s, end: Math.min(s + effectiveSeg, duration) });
   }
   // Drop imperceptible tails
   if (segs.length > 1) {
@@ -513,10 +531,10 @@ export default function App() {
   const [source, setSource] = useState(null); // { url, file }
   const [info, setInfo] = useState(null); // { w, h, duration, size, name }
   const [mode, setMode] = useState('original');
-  const [segLen, setSegLen] = useState(0); // 0 = single clip
+  const [segLen, setSegLen] = useState(30); // default 30s splits for WhatsApp
   const [res, setRes] = useState(720);
   const [fps, setFps] = useState(30);
-  const [bitrate, setBitrate] = useState(3.2);
+  const [bitrate, setBitrate] = useState('auto');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(null); // { pct, seg, total }
   const [results, setResults] = useState([]);
@@ -773,13 +791,21 @@ export default function App() {
       setError('Unreadable video file.');
       return;
     }
+    const w = v.videoWidth;
+    const h = v.videoHeight;
+    const duration = v.duration;
     setInfo({
-      w: v.videoWidth,
-      h: v.videoHeight,
-      duration: v.duration,
+      w,
+      h,
+      duration,
       size: sourceRef.current.file.size,
       name: sourceRef.current.file.name,
     });
+    // Auto Blur BG for non-9:16 videos
+    if (!isNineSixteen({ w, h })) setMode('blur');
+    else setMode('original');
+    // Auto-split: if over 60s, default to 30s splits
+    if (duration > MAX_STATUS_SECONDS + 0.05) setSegLen(30);
   };
 
   const onVideoError = () => {
@@ -839,7 +865,7 @@ export default function App() {
     }
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AC();
+      const ctx = new AC({ sampleRate: 44100 });
       const src = ctx.createMediaElementSource(video);
       const dest = ctx.createMediaStreamDestination();
       src.connect(dest); // intentionally NOT connected to speakers
@@ -865,6 +891,7 @@ export default function App() {
     const opts = {
       videoBitsPerSecond: Math.round(mbps * 1_000_000),
       audioBitsPerSecond: 128_000,
+      audioChannels: 2,
     };
     if (mimeType) opts.mimeType = mimeType;
 
@@ -985,7 +1012,9 @@ export default function App() {
     try {
       for (let i = 0; i < total; i += 1) {
         const { start, end } = segs[i];
-        const blob = await recordSegment(start, end, effMode, bitrate, fps, mime, (local) => {
+        const segDur = end - start;
+        const segMbps = bitrate === 'auto' ? autoBitrateMbps(segDur) : bitrate;
+        const blob = await recordSegment(start, end, effMode, segMbps, fps, mime, (local) => {
           const pct = ((i + local) / total) * 100;
           if (Math.abs(pct - lastPctRef.current) >= 0.4) {
             lastPctRef.current = pct;
@@ -1041,11 +1070,26 @@ export default function App() {
   const inEditor = Boolean(source);
   const atFloor = uiScale <= SCALE_FLOOR + 0.001;
   const totalOutBytes = results.reduce((n, r) => n + r.size, 0);
-  const summary = `${dims.w}×${dims.h} · ${fps} FPS · ${bitrate} Mbps · ${
+
+  /* For display and warnings, compute effective bitrate using the longest segment
+     (conservative: the first segment is full-length except possibly the last) */
+  const longestSegDur = segments.length > 0
+    ? Math.max(...segments.map((s) => s.end - s.start))
+    : info ? info.duration : 0;
+  const effectiveMbps = bitrate === 'auto'
+    ? autoBitrateMbps(longestSegDur > 0 ? longestSegDur : info ? info.duration : 1)
+    : bitrate;
+  const perPartBytes = estimatedBytes(effectiveMbps, longestSegDur > 0 ? longestSegDur : info ? info.duration : 1);
+  const anyPartOver16MB = perPartBytes > WA_MAX_BYTES;
+
+  const bitrateLabel = bitrate === 'auto'
+    ? `Auto (${effectiveMbps.toFixed(2)} Mbps)`
+    : `${bitrate} Mbps`;
+  const summary = `${dims.w}×${dims.h} · ${fps} FPS · ${bitrateLabel} · ${
     mime.includes('mp4') ? 'MP4' : 'WebM'
-  } · ${segments.length} ${segments.length === 1 ? 'clip' : 'clips'}`;
+  } · ${segments.length} ${segments.length === 1 ? 'clip' : 'clips'} · ~${fmtSize(perPartBytes)}/part`;
   const keptAs916 = Boolean(info) && mode === 'blur' && isNineSixteen(info);
-  const showChips = warnings.length > 0 || fps === 60 || keptAs916;
+  const showChips = warnings.length > 0 || fps === 60 || keptAs916 || anyPartOver16MB;
 
   const chips = showChips && (
     <div className="flex flex-wrap gap-1.5">
@@ -1057,6 +1101,11 @@ export default function App() {
           {w}
         </span>
       ))}
+      {anyPartOver16MB && (
+        <span className="rounded-full border border-amber-800/70 bg-amber-950/40 px-3 py-1 text-sm font-semibold text-amber-400">
+          ~{fmtSize(perPartBytes)}/part · may exceed 16 MB
+        </span>
+      )}
       {fps === 60 && (
         <span className="rounded-full border border-amber-800/70 bg-amber-950/40 px-3 py-1 text-sm font-semibold text-amber-400">
           60 FPS needs a 60 FPS source
