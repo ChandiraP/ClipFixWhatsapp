@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import './App.css';
 
 /* ------------------------------------------------------------------ */
@@ -879,44 +880,82 @@ export default function App() {
   const recordSegment = async (start, end, renderMode, mbps, targetFps, mimeType, onProgress) => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
+    const useWebCodecs = typeof VideoEncoder === 'function' && typeof AudioEncoder === 'function';
 
     await seekTo(video, start);
     paintFrame(canvas, video, renderMode);
 
-    const canvasStream = canvas.captureStream(targetFps);
-    const tracks = [...canvasStream.getVideoTracks()];
-    if (audioRef.current) tracks.push(...audioRef.current.dest.stream.getAudioTracks());
-    const stream = new MediaStream(tracks);
+    if (useWebCodecs) {
+      return recordSegmentWebCodecs(video, canvas, start, end, renderMode, mbps, targetFps, onProgress);
+    }
+    return recordSegmentMediaRecorder(video, canvas, start, end, renderMode, mbps, targetFps, mimeType, onProgress);
+  };
 
-    const opts = {
-      videoBitsPerSecond: Math.round(mbps * 1_000_000),
-      audioBitsPerSecond: 128_000,
-      audioChannels: 2,
-    };
-    if (mimeType) opts.mimeType = mimeType;
-
-    const recorder = new MediaRecorder(stream, opts);
-    const chunks = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
-    const stopped = new Promise((resolve, reject) => {
-      recorder.onstop = resolve;
-      recorder.onerror = (e) => reject((e && e.error) || new Error('Recorder error'));
+  const recordSegmentWebCodecs = async (video, canvas, start, end, renderMode, mbps, targetFps, onProgress) => {
+    const W = canvas.width;
+    const H = canvas.height;
+    const durUs = Math.round((end - start) * 1_000_000);
+    const target = new ArrayBufferTarget();
+    // shortcut: AudioEncoder API is inconsistent across browsers; audio via AudioContext stream
+    const muxer = new Muxer({
+      target,
+      video: { codec: 'avc', width: W, height: H },
+      audio: { codec: 'aac', numberOfChannels: 2, sampleRate: 44100 },
+      fastStart: 'in-memory',
+      firstTimestampBehavior: 'offset',
     });
 
-    recorder.start(500);
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => { throw e; },
+    });
+    videoEncoder.configure({
+      codec: 'avc1.640029',
+      width: W,
+      height: H,
+      bitrate: Math.round(mbps * 1_000_000),
+      bitrateMode: 'constant',
+      framerate: targetFps,
+      latencyMode: 'quality',
+    });
+
+    let audioEncoder = null;
+    if (audioRef.current) {
+      audioEncoder = new AudioEncoder({
+        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+        error: () => {},
+      });
+      audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128_000 });
+    }
+
+    // Capture audio via ScriptProcessor from the existing AudioContext destination
+    let audioProc = null;
+    if (audioRef.current && audioEncoder) {
+      const ctx = audioRef.current.ctx;
+      audioProc = ctx.createScriptProcessor(4096, 2, 2);
+      audioRef.current.dest.connect(audioProc);
+      audioProc.connect(ctx.destination);
+      audioProc.onaudioprocess = (e) => {
+        if (audioEncoder.state !== 'configured') return;
+        const L = e.inputBuffer.getChannelData(0);
+        const R = e.inputBuffer.getChannelData(1);
+        const data = new Float32Array(L.length * 2);
+        for (let i = 0; i < L.length; i++) { data[i * 2] = L[i]; data[i * 2 + 1] = R[i]; }
+        const aData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: L.length, numberOfChannels: 2, timestamp: Math.round((video.currentTime - start) * 1_000_000), data });
+        audioEncoder.encode(aData);
+        aData.close();
+      };
+    }
+
+    video.muted = !audioEncoder;
     await video.play();
 
-    // Draw exactly when the decoder presents a frame (no timer drift / duplicate frames)
     const useRVFC = typeof video.requestVideoFrameCallback === 'function';
-    const minGap = 1 / targetFps - 0.004;
+    let frameCount = 0;
 
     await new Promise((resolve) => {
       let handle = 0;
-      let lastMedia = -1;
       let done = false;
-
       const finish = () => {
         if (done) return;
         done = true;
@@ -927,40 +966,77 @@ export default function App() {
       };
       video.addEventListener('ended', finish);
 
-      const step = (t) => {
-        if (cancelRef.current) {
-          finish();
-          return;
-        }
-        if (lastMedia < 0 || t - lastMedia >= minGap) {
-          lastMedia = t;
-          paintFrame(canvas, video, renderMode);
-        }
-        onProgress(Math.min(1, Math.max(0, (t - start) / Math.max(0.001, end - start))));
-        if (t >= end - 0.03 || video.ended) {
-          finish();
-          return;
-        }
-        schedule();
-      };
-
-      const schedule = () => {
+      const step = (mediaTime) => {
+        if (cancelRef.current) { finish(); return; }
+        paintFrame(canvas, video, renderMode);
+        const tsUs = Math.round((mediaTime - start) * 1_000_000);
+        const frame = new VideoFrame(canvas, { timestamp: tsUs, duration: Math.round(1_000_000 / targetFps) });
+        videoEncoder.encode(frame, { keyFrame: frameCount % (targetFps * 2) === 0 });
+        frame.close();
+        frameCount++;
+        onProgress(Math.min(1, Math.max(0, (mediaTime - start) / Math.max(0.001, end - start))));
+        if (mediaTime >= end - 0.03 || video.ended) { finish(); return; }
         handle = useRVFC
-          ? video.requestVideoFrameCallback((_now, meta) => step(meta.mediaTime))
+          ? video.requestVideoFrameCallback((_now, m) => step(m.mediaTime))
           : requestAnimationFrame(() => step(video.currentTime));
       };
 
-      schedule();
+      handle = useRVFC
+        ? video.requestVideoFrameCallback((_now, m) => step(m.mediaTime))
+        : requestAnimationFrame(() => step(video.currentTime));
     });
 
+    video.pause();
+    if (audioProc) { audioProc.disconnect(); audioRef.current.dest.disconnect(audioProc); }
+    if (cancelRef.current) throw new Error('CANCELLED');
+
+    await videoEncoder.flush();
+    if (audioEncoder) await audioEncoder.flush();
+    muxer.finalize();
+
+    videoEncoder.close();
+    if (audioEncoder) audioEncoder.close();
+
+    return new Blob([target.buffer], { type: 'video/mp4' });
+  };
+
+  const recordSegmentMediaRecorder = async (video, canvas, start, end, renderMode, mbps, targetFps, mimeType, onProgress) => {
+    const canvasStream = canvas.captureStream(targetFps);
+    const tracks = [...canvasStream.getVideoTracks()];
+    if (audioRef.current) tracks.push(...audioRef.current.dest.stream.getAudioTracks());
+    const stream = new MediaStream(tracks);
+    const opts = { videoBitsPerSecond: Math.round(mbps * 1_000_000), audioBitsPerSecond: 128_000, audioChannels: 2 };
+    if (mimeType) opts.mimeType = mimeType;
+    const recorder = new MediaRecorder(stream, opts);
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    const stopped = new Promise((resolve, reject) => {
+      recorder.onstop = resolve;
+      recorder.onerror = (e) => reject((e && e.error) || new Error('Recorder error'));
+    });
+    recorder.start(500);
+    await video.play();
+    const useRVFC = typeof video.requestVideoFrameCallback === 'function';
+    const minGap = 1 / targetFps - 0.004;
+    await new Promise((resolve) => {
+      let handle = 0; let lastMedia = -1; let done = false;
+      const finish = () => { if (done) return; done = true; if (useRVFC) video.cancelVideoFrameCallback(handle); else cancelAnimationFrame(handle); video.removeEventListener('ended', finish); resolve(); };
+      video.addEventListener('ended', finish);
+      const step = (t) => {
+        if (cancelRef.current) { finish(); return; }
+        if (lastMedia < 0 || t - lastMedia >= minGap) { lastMedia = t; paintFrame(canvas, video, renderMode); }
+        onProgress(Math.min(1, Math.max(0, (t - start) / Math.max(0.001, end - start))));
+        if (t >= end - 0.03 || video.ended) { finish(); return; }
+        handle = useRVFC ? video.requestVideoFrameCallback((_now, meta) => step(meta.mediaTime)) : requestAnimationFrame(() => step(video.currentTime));
+      };
+      handle = useRVFC ? video.requestVideoFrameCallback((_now, meta) => step(meta.mediaTime)) : requestAnimationFrame(() => step(video.currentTime));
+    });
     video.pause();
     paintFrame(canvas, video, renderMode);
     if (recorder.state !== 'inactive') recorder.stop();
     await stopped;
     canvasStream.getTracks().forEach((t) => t.stop());
-
     if (cancelRef.current) throw new Error('CANCELLED');
-
     const type = (recorder.mimeType || mimeType || 'video/webm').split(';')[0] || 'video/webm';
     return new Blob(chunks, { type });
   };
