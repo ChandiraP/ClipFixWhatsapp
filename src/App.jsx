@@ -35,8 +35,8 @@ const FPS_OPTIONS = [
 
 const BITRATES = [
   { id: 'auto', label: 'Auto' },
+  { id: 2, label: '2' },
   { id: 3.2, label: '3.2' },
-  { id: 4, label: '4' },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -142,11 +142,12 @@ function ratioLabel(w, h) {
 
 /* Target 15.3 MB per part, clamp between 800 kbps and 4200 kbps */
 function autoBitrateMbps(durationSeconds) {
-  const TARGET_BYTES = 15.3 * 1024 * 1024;
+  // shortcut: MediaRecorder bitrate is advisory; 12 MB target gives ~20% headroom for encoder overrun
+  const TARGET_BYTES = 12 * 1024 * 1024;
   const AUDIO_BPS = 131_072;
   const MUX_BPS = 16_384;
   const raw = (TARGET_BYTES * 8) / durationSeconds - AUDIO_BPS - MUX_BPS;
-  return Math.min(4.2, Math.max(0.8, raw / 1_000_000));
+  return Math.min(3.2, Math.max(0.8, raw / 1_000_000));
 }
 
 /* Estimated output size in bytes for a part */
